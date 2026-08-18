@@ -124,18 +124,35 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
 
 
 # ============================================================
-# 📥 ดึงข้อมูลราคาสด
+# 📥 ดึงข้อมูลราคาสด (พร้อม retry — Yahoo Finance มักบล็อก IP ของ cloud/data center
+# ชั่วคราวเมื่อยิง request ถี่ ต้องลองใหม่หลายครั้งและหน่วงเวลาไว้)
 # ============================================================
+FETCH_MAX_RETRIES = 4
+FETCH_RETRY_DELAY_SEC = 15
+
+
 def fetch_data() -> pd.DataFrame:
-    df = yf.download(TICKER, period=LOOKBACK, interval=INTERVAL, progress=False)
-    if df.empty:
-        raise RuntimeError(
-            f"ดึงข้อมูล {TICKER} ไม่ได้ — ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต หรือลอง TICKER อื่น เช่น 'XAUUSD=X'"
-        )
-    # yfinance บางเวอร์ชันคืน MultiIndex columns เมื่อดึงสัญลักษณ์เดียว — flatten ให้เรียบร้อย
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
+    last_error = None
+    for attempt in range(1, FETCH_MAX_RETRIES + 1):
+        try:
+            df = yf.download(TICKER, period=LOOKBACK, interval=INTERVAL, progress=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                return df
+            last_error = RuntimeError("ได้ข้อมูลว่างเปล่ากลับมา (empty DataFrame)")
+        except Exception as e:
+            last_error = e
+
+        if attempt < FETCH_MAX_RETRIES:
+            print(f"⚠️  ดึงข้อมูลไม่สำเร็จ (ครั้งที่ {attempt}/{FETCH_MAX_RETRIES}): {last_error}")
+            print(f"   รอ {FETCH_RETRY_DELAY_SEC} วินาทีแล้วลองใหม่...")
+            time.sleep(FETCH_RETRY_DELAY_SEC)
+
+    raise RuntimeError(
+        f"ดึงข้อมูล {TICKER} ไม่ได้หลังลอง {FETCH_MAX_RETRIES} ครั้ง (สาเหตุล่าสุด: {last_error}) "
+        f"— Yahoo Finance อาจบล็อก IP ชั่วคราว ลองรันใหม่ภายหลัง"
+    )
 
 
 # ============================================================

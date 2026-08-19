@@ -33,7 +33,13 @@ on:
     - cron: "*/30 3-6,9-12,16 * * 1-5"
     # ช่วงเช็คห่างทุก 30 นาที ชั่วโมง 17 UTC = ไทยวันถัดไป 00:00 → ต้องเลื่อน dow ไป -1
     - cron: "*/30 17 * * 0-4"
-  workflow_dispatch: {}   # กดรันเองได้จากหน้า Actions ด้วย (ไว้ทดสอบ)
+  workflow_dispatch:      # กดรันเองได้จากหน้า Actions ด้วย (ไว้ทดสอบ)
+    inputs:
+      test_alert:
+        description: "ทดสอบระบบแจ้งเตือนทันที (ไม่รอสัญญาณจริง) — ติ๊กช่องนี้เพื่อทดสอบ"
+        required: false
+        type: boolean
+        default: false
 
 # อนุญาตให้ workflow commit ไฟล์ state กลับเข้า repo ได้
 permissions:
@@ -58,7 +64,13 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python xauusd_live_signal.py --use-state-file
+        run: |
+          if [ "${{ github.event.inputs.test_alert }}" = "true" ]; then
+            echo "🔔 โหมดทดสอบแจ้งเตือน (--test-alert)"
+            python xauusd_live_signal.py --test-alert
+          else
+            python xauusd_live_signal.py --use-state-file
+          fi
 
       - name: บันทึกสถานะล่าสุดกลับเข้า repo
         run: |

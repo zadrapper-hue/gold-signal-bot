@@ -39,6 +39,7 @@ TP คำนวณจาก Risk:Reward Ratio (ค่าเริ่มต้น
 
 import argparse
 import ctypes
+import json
 import os
 import sys
 import time
@@ -504,26 +505,69 @@ def print_signal(result: dict):
 
 
 # ============================================================
-# 💾 บันทึกสัญญาณล่าสุด (ไฟล์) - ใช้ตอนรันแบบครั้งเดียวต่อครั้ง (เช่นบน GitHub Actions)
-# เพื่อให้รู้ว่าสัญญาณ "เปลี่ยน" จากรอบที่แล้วไหม แม้แต่ละรอบเป็นโปรเซสใหม่
+# 💾 บันทึกสถานะล่าสุด (ไฟล์ JSON) - ใช้ตอนรันแบบครั้งเดียวต่อครั้ง (เช่นบน GitHub Actions)
+# เก็บทั้ง "สัญญาณที่รอยืนยัน" (pending) และ "สัญญาณล่าสุดที่แจ้งเตือนไปแล้ว" (alerted)
+# เพื่อกันแจ้งเตือนซ้ำ และกันสัญญาณสั่นไหวใกล้เกณฑ์ (whipsaw)
 # ============================================================
 STATE_FILE = "last_signal.txt"
 
+# ต้องเห็นสัญญาณเดิมซ้ำติดกันกี่รอบ ถึงจะยอมส่งแจ้งเตือน (ยิ่งมาก ยิ่งแม่นแต่ช้าลง)
+CONFIRMATION_BARS = 2
 
-def read_last_signal_from_file() -> str | None:
+
+def load_state(use_file: bool) -> dict:
+    default = {"pending_signal": None, "pending_count": 0, "last_alerted_signal": None}
+    if not use_file:
+        return default
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() or None
-    except FileNotFoundError:
-        return None
+            content = f.read().strip()
+            if not content:
+                return default
+            data = json.loads(content)
+            return {**default, **data}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
 
 
-def write_last_signal_to_file(signal: str):
+def save_state(state: dict, use_file: bool):
+    if not use_file:
+        return
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            f.write(signal or "")
+            json.dump(state, f, ensure_ascii=False)
     except Exception as e:
         print(f"⚠️  บันทึกสถานะไม่สำเร็จ: {e}")
+
+
+def update_state_and_check_alert(state: dict, current_signal: str | None) -> tuple[dict, bool]:
+    """
+    รับสัญญาณปัจจุบัน คืนค่า (state ใหม่, ควรส่งแจ้งเตือนไหม)
+    ต้องเห็นสัญญาณเดียวกันซ้ำ CONFIRMATION_BARS รอบติดกัน และยังไม่เคยแจ้งเตือนสัญญาณนี้มาก่อน
+    """
+    actionable = current_signal in ("BUY / LONG", "SELL / SHORT")
+
+    if not actionable:
+        # สัญญาณหลุดจากโซนเข้าไม้แล้ว รีเซ็ตทั้ง pending และ alerted เพื่อให้รอบหน้าถ้าเจอสัญญาณใหม่ แจ้งได้อีก
+        state["pending_signal"] = None
+        state["pending_count"] = 0
+        state["last_alerted_signal"] = None
+        return state, False
+
+    if current_signal == state.get("pending_signal"):
+        state["pending_count"] = state.get("pending_count", 0) + 1
+    else:
+        state["pending_signal"] = current_signal
+        state["pending_count"] = 1
+
+    should_alert = (
+        state["pending_count"] >= CONFIRMATION_BARS
+        and current_signal != state.get("last_alerted_signal")
+    )
+    if should_alert:
+        state["last_alerted_signal"] = current_signal
+
+    return state, should_alert
 
 
 # ============================================================
@@ -535,7 +579,7 @@ def main():
     parser.add_argument("--interval", type=int, default=15, help="ความถี่รีเฟรช (นาที) เมื่อใช้ --loop")
     parser.add_argument("--test-alert", action="store_true", help="ทดสอบระบบแจ้งเตือนทันที (ไม่ต้องรอสัญญาณจริง)")
     parser.add_argument("--use-state-file", action="store_true",
-                         help="อ่าน/บันทึกสัญญาณล่าสุดจากไฟล์ (ใช้ตอนรันบน GitHub Actions ที่แต่ละรอบเป็นโปรเซสใหม่)")
+                         help="อ่าน/บันทึกสถานะจากไฟล์ (ใช้ตอนรันบน GitHub Actions ที่แต่ละรอบเป็นโปรเซสใหม่)")
     args = parser.parse_args()
 
     if args.test_alert:
@@ -548,32 +592,31 @@ def main():
         print("✅ ทดสอบเสร็จ — ถ้าไม่มีเสียง/ป๊อปอัพ/ข้อความ Telegram เด้งขึ้นมา ให้ตรวจสอบ CONFIG ด้านบนไฟล์")
         return
 
-    last_signal = read_last_signal_from_file() if args.use_state_file else None
+    state = load_state(args.use_state_file)
 
     def run_once():
-        nonlocal last_signal
+        nonlocal state
         try:
             df = fetch_data()
             result = compute_signal(df)
             print_signal(result)
 
             current_signal = result.get("signal")
-            actionable = current_signal in ("BUY / LONG", "SELL / SHORT")
-            signal_changed = current_signal != last_signal
+            state, should_alert = update_state_and_check_alert(state, current_signal)
 
-            if actionable and signal_changed:
-                print("🔔 สัญญาณเปลี่ยน — กำลังส่งแจ้งเตือน...")
+            if should_alert:
+                print(f"🔔 ยืนยันสัญญาณครบ {CONFIRMATION_BARS} รอบติดกันแล้ว — กำลังส่งแจ้งเตือน...")
                 fire_alerts(result)
+            elif current_signal in ("BUY / LONG", "SELL / SHORT"):
+                print(f"⏳ พบสัญญาณ {current_signal} รอบที่ {state['pending_count']}/{CONFIRMATION_BARS} — รอยืนยันอีกรอบก่อนส่ง")
 
-            last_signal = current_signal
-            if args.use_state_file:
-                write_last_signal_to_file(current_signal or "")
+            save_state(state, args.use_state_file)
         except Exception as e:
             print(f"❌ เกิดข้อผิดพลาด: {e}")
 
     if args.loop:
         print(f"🔄 เริ่มรันแบบวนซ้ำทุก {args.interval} นาที (กด Ctrl+C เพื่อหยุด)")
-        print("   จะแจ้งเตือนก็ต่อเมื่อสัญญาณเปลี่ยนเป็น BUY หรือ SELL ใหม่เท่านั้น\n")
+        print(f"   จะแจ้งเตือนก็ต่อเมื่อเห็นสัญญาณเดิมซ้ำ {CONFIRMATION_BARS} รอบติดกัน (กันสัญญาณหลอก)\n")
         while True:
             run_once()
             time.sleep(args.interval * 60)

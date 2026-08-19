@@ -246,60 +246,15 @@ def is_bearish_confirmation(df: pd.DataFrame) -> bool:
     return bool(bearish_candle and breaks_prev_low)
 
 
-def compute_range_mode_signal(df: pd.DataFrame, atr_val: float, bb_upper: float, bb_lower: float) -> dict | None:
-    """
-    โหมด Range-Trading: ใช้ตอนตลาด sideways (ADX ต่ำ)
-    สัญญาณเข้า = เส้น RSI กับ Williams %R (ปรับสเกลเป็น 0-100 แล้ว) ตัดกัน
-    กรอบเทรด = ราคาต้องอยู่ภายใน Bollinger Bands เท่านั้น (ไม่ทะลุกรอบ)
-    คืนค่า None ถ้าเงื่อนไขไม่ครบ
-    """
-    last, prev = df.iloc[-1], df.iloc[-2]
-    price = float(last["Close"])
-    rsi_now, rsi_prev = float(last["rsi"]), float(prev["rsi"])
-    wr_now, wr_prev = float(last["wr_rescaled"]), float(prev["wr_rescaled"])
 
-    if pd.isna(rsi_prev) or pd.isna(wr_prev) or pd.isna(rsi_now) or pd.isna(wr_now):
-        return None
-
-    # ต้องอยู่ในกรอบ Bollinger Bands เท่านั้น (ไม่ทะลุ) ถึงจะพิจารณาสัญญาณนี้
-    within_bb = bb_lower <= price <= bb_upper
-    if not within_bb:
-        return {"signal": "NO TRADE / รอสัญญาณ", "range_mode": True,
-                "reason": "ราคาทะลุกรอบ Bollinger Bands ไปแล้ว ไม่เข้าเงื่อนไข range-trading"}
-
-    # หาจุดตัด: RSI ตัดขึ้นเหนือ Williams%R(rescaled) = สัญญาณ bullish, ตัดลงใต้ = bearish
-    crossed_up = rsi_prev <= wr_prev and rsi_now > wr_now
-    crossed_down = rsi_prev >= wr_prev and rsi_now < wr_now
-
-    result = {
-        "range_mode": True, "price": price, "rsi": rsi_now, "wr_rescaled": wr_now,
-        "bb_upper": bb_upper, "bb_lower": bb_lower,
-    }
-
-    if crossed_up:
-        sl = price - ATR_SL_MULT_RANGE * atr_val
-        risk = price - sl
-        result["signal"] = "BUY / LONG"
-        result["stop_loss"] = sl
-        result["take_profit"] = min(price + risk * TP_RR_RATIO, bb_upper)  # ไม่เกิน BB บน
-        result["risk_points"] = risk
-        result["rr_ratio"] = TP_RR_RATIO
-    elif crossed_down:
-        sl = price + ATR_SL_MULT_RANGE * atr_val
-        risk = sl - price
-        result["signal"] = "SELL / SHORT"
-        result["stop_loss"] = sl
-        result["take_profit"] = max(price - risk * TP_RR_RATIO, bb_lower)  # ไม่เกิน BB ล่าง
-        result["risk_points"] = risk
-        result["rr_ratio"] = TP_RR_RATIO
-    else:
-        result["signal"] = "NO TRADE / รอสัญญาณ"
-        result["reason"] = "รอ RSI กับ Williams %R ตัดกัน (ยังไม่เกิดจุดตัดในแท่งล่าสุด)"
-
-    return result
-
-
-ATR_SL_MULT_RANGE = 1.5  # SL ในโหมด range ใช้ ATR คูณน้อยกว่าโหมดเทรนด์ เพราะเป้าหมายกำไรก็เล็กกว่า (แกว่งในกรอบ)
+# ============================================================
+# 🧮 Confluence Score — รวมทุกตัวชี้วัดเข้าด้วยกัน โดยให้น้ำหนักตาม ADX
+# แทนการสลับโหมดแบบเปิด/ปิด ตัวชี้วัดฝั่งเทรนด์กับฝั่ง range จะ "ถ่วงน้ำหนัก"
+# ตามความแรงของเทรนด์ (ADX) แล้วรวมเป็นคะแนนเดียว
+# ============================================================
+CONFLUENCE_BUY_THRESHOLD = 0.5     # คะแนนรวม (-1 ถึง +1) ต้อง >= ค่านี้ ถึงจะออกสัญญาณ BUY
+CONFLUENCE_SELL_THRESHOLD = -0.5   # คะแนนรวม ต้อง <= ค่านี้ ถึงจะออกสัญญาณ SELL
+ADX_FULL_TREND_WEIGHT = 40         # ADX ที่ถือว่า "เทรนด์เต็มร้อย" (น้ำหนักฝั่งเทรนด์ = 1.0)
 
 
 def compute_signal(df: pd.DataFrame) -> dict:
@@ -313,7 +268,7 @@ def compute_signal(df: pd.DataFrame) -> dict:
     df["adx"] = adx(df, ADX_PERIOD)
     df["wr_rescaled"] = williams_r_rescaled(df, WILLIAMS_R_PERIOD)
 
-    last = df.iloc[-1]
+    last, prev = df.iloc[-1], df.iloc[-2]
     price = float(last["Close"])
     ema_val = float(last["ema_trend"])
     ema_pb_val = float(last["ema_pullback"])
@@ -325,62 +280,55 @@ def compute_signal(df: pd.DataFrame) -> dict:
     bb_lower = float(last["bb_lower"])
     bb_mid = float(last["bb_mid"])
     adx_val = float(last["adx"])
+    wr_now, wr_prev = float(last["wr_rescaled"]), float(prev["wr_rescaled"])
+    rsi_prev = float(prev["rsi"])
 
     core_ready = not (pd.isna(ema_val) or pd.isna(rsi_val) or pd.isna(atr_val) or pd.isna(ema_pb_val))
     if not core_ready:
         return {"signal": "NOT_ENOUGH_DATA", "reason": "ข้อมูลย้อนหลังไม่พอสำหรับคำนวณ EMA/RSI/ATR"}
 
-    # --- สลับโหมดอัตโนมัติตาม ADX: sideways (ADX ต่ำ) ใช้ range mode, มีเทรนด์ใช้โหมดเดิม ---
-    market_regime = "ไม่ทราบ (ADX ยังไม่พอ)"
-    if not pd.isna(adx_val):
-        market_regime = "Sideways (ADX ต่ำ)" if adx_val < ADX_TREND_THRESHOLD else "มีเทรนด์ (ADX สูง)"
-
-    if ENABLE_RANGE_MODE and not pd.isna(adx_val) and adx_val < ADX_TREND_THRESHOLD:
-        range_result = compute_range_mode_signal(df, atr_val, bb_upper, bb_lower)
-        if range_result is not None:
-            range_result["adx"] = adx_val
-            range_result["market_regime"] = market_regime
-            return range_result
-        # ถ้าข้อมูล range mode ยังไม่พอ (NaN) จะร่วงลงไปใช้ trend mode ตามปกติด้านล่าง
-
     uptrend = price > ema_val
     downtrend = price < ema_val
 
-    # --- เงื่อนไข pullback: ราคาต้องใกล้ EMA21 (ไม่ไล่ราคาที่วิ่งไปไกลแล้ว) ---
+    # --- น้ำหนักตาม ADX: เทรนด์แรง → เน้นตัวชี้วัดฝั่งเทรนด์ / sideways → เน้นฝั่ง range (RSI x Williams%R) ---
+    if pd.isna(adx_val):
+        trend_weight, range_weight = 0.5, 0.5
+        market_regime = "ไม่ทราบ (ADX ยังไม่พอ)"
+    else:
+        trend_weight = min(max(adx_val / ADX_FULL_TREND_WEIGHT, 0.0), 1.0)
+        range_weight = 1.0 - trend_weight
+        market_regime = "มีเทรนด์ (ADX สูง)" if adx_val >= ADX_TREND_THRESHOLD else "Sideways (ADX ต่ำ)"
+
+    # --- ฝั่งเทรนด์: EMA200 + RSI momentum + candle confirm + MACD + pullback proximity ---
+    bull_confirm = is_bullish_confirmation(df)
+    bear_confirm = is_bearish_confirmation(df)
     dist_from_pullback_ema = abs(price - ema_pb_val)
     near_pullback_ema = dist_from_pullback_ema <= (PULLBACK_MAX_DIST_ATR * atr_val)
 
-    # --- เงื่อนไขโมเมนตัม (RSI) ---
-    rsi_long_ok = RSI_BUY_MIN < rsi_val < 70
-    rsi_short_ok = 30 < rsi_val < RSI_SELL_MAX
+    trend_votes = [1.0 if uptrend else -1.0, 1.0 if rsi_val > 50 else -1.0]
+    if bull_confirm:
+        trend_votes.append(1.0)
+    elif bear_confirm:
+        trend_votes.append(-1.0)
+    if ENABLE_MACD_FILTER and not pd.isna(macd_line) and not pd.isna(macd_sig):
+        trend_votes.append(1.0 if macd_line > macd_sig else -1.0)
+    trend_votes.append(1.0 if near_pullback_ema and uptrend else (-1.0 if near_pullback_ema and downtrend else 0.0))
+    trend_score = sum(trend_votes) / len(trend_votes)
 
-    # --- เงื่อนไขแท่งเทียนยืนยัน ---
-    bull_confirm = is_bullish_confirmation(df)
-    bear_confirm = is_bearish_confirmation(df)
+    # --- ฝั่ง range: RSI x Williams %R ตัดกัน ---
+    range_ready = not (pd.isna(rsi_prev) or pd.isna(wr_prev) or pd.isna(wr_now))
+    crossed_up = range_ready and rsi_prev <= wr_prev and rsi_val > wr_now
+    crossed_down = range_ready and rsi_prev >= wr_prev and rsi_val < wr_now
+    range_score = 1.0 if crossed_up else (-1.0 if crossed_down else 0.0)
 
-    # --- ตัวกรอง MACD (เปิด/ปิดได้): เส้น MACD ต้องอยู่ฝั่งเดียวกับทิศทางที่จะเข้า ---
-    macd_ready = not (pd.isna(macd_line) or pd.isna(macd_sig))
-    if ENABLE_MACD_FILTER and macd_ready:
-        macd_long_ok = macd_line > macd_sig
-        macd_short_ok = macd_line < macd_sig
-    else:
-        macd_long_ok = macd_short_ok = True  # ปิดใช้งาน หรือข้อมูลยังไม่พอ = ไม่กรอง
+    combined_score = trend_weight * trend_score + range_weight * range_score
 
-    # --- ตัวกรอง Bollinger Bands (เปิด/ปิดได้): กันไม่ให้เข้าตอนราคาสุดขั้วเกินไป ---
-    # BUY: ไม่เข้าถ้าราคาทะลุ upper band ไปแล้ว (อาจ overextended)
-    # SELL: ไม่เข้าถ้าราคาทะลุ lower band ไปแล้ว
+    # --- ตัวกรองความปลอดภัยร่วม (ใช้ทั้งสองฝั่งเสมอ): ราคาต้องไม่ยืดเกินกรอบ Bollinger Bands ---
     bb_ready = not (pd.isna(bb_upper) or pd.isna(bb_lower))
-    if ENABLE_BB_FILTER and bb_ready:
-        bb_long_ok = price <= bb_upper
-        bb_short_ok = price >= bb_lower
-    else:
-        bb_long_ok = bb_short_ok = True
-
-    long_ok = uptrend and rsi_long_ok and near_pullback_ema and bull_confirm and macd_long_ok and bb_long_ok
-    short_ok = downtrend and rsi_short_ok and near_pullback_ema and bear_confirm and macd_short_ok and bb_short_ok
+    price_within_bb = (bb_lower <= price <= bb_upper) if (ENABLE_BB_FILTER and bb_ready) else True
 
     # --- หา swing high/low ล่าสุดสำหรับ SL แบบอิงโครงสร้าง ---
-    recent = df.iloc[-(SWING_LOOKBACK + 1):-1]  # ไม่รวมแท่งปัจจุบัน กันมองย้อนอนาคต
+    recent = df.iloc[-(SWING_LOOKBACK + 1):-1]
     swing_low = float(recent["Low"].min())
     swing_high = float(recent["High"].max())
 
@@ -396,20 +344,22 @@ def compute_signal(df: pd.DataFrame) -> dict:
         "bb_upper": bb_upper,
         "bb_mid": bb_mid,
         "bb_lower": bb_lower,
+        "wr_rescaled": wr_now,
         "trend": "ขาขึ้น (Uptrend)" if uptrend else "ขาลง (Downtrend)",
-        "near_pullback": near_pullback_ema,
-        "bull_confirm": bull_confirm,
-        "bear_confirm": bear_confirm,
-        "macd_long_ok": macd_long_ok,
-        "macd_short_ok": macd_short_ok,
-        "bb_long_ok": bb_long_ok,
-        "bb_short_ok": bb_short_ok,
         "adx": adx_val,
         "market_regime": market_regime,
-        "range_mode": False,
+        "trend_weight": trend_weight,
+        "range_weight": range_weight,
+        "trend_score": trend_score,
+        "range_score": range_score,
+        "combined_score": combined_score,
+        "price_within_bb": price_within_bb,
     }
 
-    if long_ok:
+    buy_ok = combined_score >= CONFLUENCE_BUY_THRESHOLD and price_within_bb
+    sell_ok = combined_score <= CONFLUENCE_SELL_THRESHOLD and price_within_bb
+
+    if buy_ok:
         sl = swing_low - SL_BUFFER_ATR_MULT * atr_val
         risk = price - sl
         result["signal"] = "BUY / LONG"
@@ -417,7 +367,7 @@ def compute_signal(df: pd.DataFrame) -> dict:
         result["take_profit"] = price + risk * TP_RR_RATIO
         result["risk_points"] = risk
         result["rr_ratio"] = TP_RR_RATIO
-    elif short_ok:
+    elif sell_ok:
         sl = swing_high + SL_BUFFER_ATR_MULT * atr_val
         risk = sl - price
         result["signal"] = "SELL / SHORT"
@@ -428,27 +378,13 @@ def compute_signal(df: pd.DataFrame) -> dict:
     else:
         result["signal"] = "NO TRADE / รอสัญญาณ"
         reason = []
-        if not uptrend and not downtrend:
-            reason.append("ราคาใกล้ EMA200 มาก ยังไม่มีทิศทางชัด")
-        if uptrend and not rsi_long_ok:
-            reason.append(f"เทรนด์ขึ้นแต่ RSI={rsi_val:.1f} อยู่นอกช่วง {RSI_BUY_MIN}-70")
-        if downtrend and not rsi_short_ok:
-            reason.append(f"เทรนด์ลงแต่ RSI={rsi_val:.1f} อยู่นอกช่วง 30-{RSI_SELL_MAX}")
-        if (uptrend or downtrend) and not near_pullback_ema:
-            reason.append(f"ราคาห่าง EMA{EMA_PULLBACK_PERIOD} เกินไป (รอราคาย่อกลับมาก่อน)")
-        if uptrend and rsi_long_ok and near_pullback_ema and not bull_confirm:
-            reason.append("รอแท่งเทียนยืนยันขาขึ้น (ยังไม่ปิดทะลุแท่งก่อนหน้า)")
-        if downtrend and rsi_short_ok and near_pullback_ema and not bear_confirm:
-            reason.append("รอแท่งเทียนยืนยันขาลง (ยังไม่ปิดทะลุแท่งก่อนหน้า)")
-        if ENABLE_MACD_FILTER and uptrend and not macd_long_ok:
-            reason.append("MACD ยังไม่ตัดขึ้นเหนือ signal line (โมเมนตัมยังไม่สนับสนุนขาขึ้น)")
-        if ENABLE_MACD_FILTER and downtrend and not macd_short_ok:
-            reason.append("MACD ยังไม่ตัดลงใต้ signal line (โมเมนตัมยังไม่สนับสนุนขาลง)")
-        if ENABLE_BB_FILTER and uptrend and not bb_long_ok:
-            reason.append("ราคาทะลุ Bollinger Band บนไปแล้ว (อาจ overextended รอย่อก่อน)")
-        if ENABLE_BB_FILTER and downtrend and not bb_short_ok:
-            reason.append("ราคาทะลุ Bollinger Band ล่างไปแล้ว (อาจ overextended รอย่อก่อน)")
-        result["reason"] = " / ".join(reason) if reason else "เงื่อนไขยังไม่ครบ"
+        if not price_within_bb:
+            reason.append("ราคาทะลุกรอบ Bollinger Bands ไปแล้ว (อาจ overextended รอย่อก่อน)")
+        reason.append(
+            f"คะแนนรวม {combined_score:+.2f} ยังไม่ถึงเกณฑ์ (ต้อง ≥{CONFLUENCE_BUY_THRESHOLD:+.2f} สำหรับ BUY "
+            f"หรือ ≤{CONFLUENCE_SELL_THRESHOLD:+.2f} สำหรับ SELL)"
+        )
+        result["reason"] = " / ".join(reason)
 
     return result
 
@@ -527,32 +463,29 @@ def print_signal(result: dict):
         print(f"⚠️  {result['reason']}")
         return
 
-    is_range_mode = result.get("range_mode", False)
     regime = result.get("market_regime")
     adx_val = result.get("adx")
     if regime:
         adx_txt = f" (ADX={adx_val:.1f})" if adx_val is not None and not pd.isna(adx_val) else ""
         print(f"สภาพตลาด (Market Regime)    : {regime}{adx_txt}")
-        print(f"โหมดที่ใช้                  : {'🔁 Range-Trading (RSI x Williams %R)' if is_range_mode else '📈 Trend-Following'}")
+        print(f"น้ำหนักคะแนน               : เทรนด์ {result['trend_weight']*100:.0f}% / range {result['range_weight']*100:.0f}%")
         print("-" * 55)
 
     print(f"ราคาปัจจุบัน (XAUUSD proxy) : {result['price']:.2f}")
-
-    if is_range_mode:
-        print(f"RSI {RSI_PERIOD}                      : {result['rsi']:.1f}")
-        print(f"Williams %R (rescaled)     : {result['wr_rescaled']:.1f}")
-        print(f"Bollinger Bands            : {result['bb_lower']:.2f} - {result['bb_upper']:.2f}")
-    else:
-        print(f"EMA {EMA_TREND_PERIOD}                    : {result['ema200']:.2f}")
-        print(f"EMA {EMA_PULLBACK_PERIOD} (pullback)          : {result['ema21']:.2f}")
-        print(f"RSI {RSI_PERIOD}                      : {result['rsi']:.1f}")
-        print(f"ATR {ATR_PERIOD}                      : {result['atr']:.2f}")
-        if ENABLE_MACD_FILTER and not pd.isna(result.get("macd")):
-            macd_state = "เหนือ signal (ขาขึ้น)" if result["macd"] > result["macd_signal"] else "ใต้ signal (ขาลง)"
-            print(f"MACD                       : {result['macd']:.2f} vs signal {result['macd_signal']:.2f} ({macd_state})")
-        if ENABLE_BB_FILTER and not pd.isna(result.get("bb_upper")):
-            print(f"Bollinger Bands            : {result['bb_lower']:.2f} - {result['bb_mid']:.2f} - {result['bb_upper']:.2f}")
-        print(f"ทิศทางเทรนด์                : {result['trend']}")
+    print(f"EMA {EMA_TREND_PERIOD}                    : {result['ema200']:.2f}")
+    print(f"EMA {EMA_PULLBACK_PERIOD} (pullback)          : {result['ema21']:.2f}")
+    print(f"RSI {RSI_PERIOD}                      : {result['rsi']:.1f}")
+    print(f"Williams %R (rescaled)     : {result['wr_rescaled']:.1f}")
+    print(f"ATR {ATR_PERIOD}                      : {result['atr']:.2f}")
+    if ENABLE_MACD_FILTER and not pd.isna(result.get("macd")):
+        macd_state = "เหนือ signal (ขาขึ้น)" if result["macd"] > result["macd_signal"] else "ใต้ signal (ขาลง)"
+        print(f"MACD                       : {result['macd']:.2f} vs signal {result['macd_signal']:.2f} ({macd_state})")
+    if ENABLE_BB_FILTER and not pd.isna(result.get("bb_upper")):
+        print(f"Bollinger Bands            : {result['bb_lower']:.2f} - {result['bb_mid']:.2f} - {result['bb_upper']:.2f}")
+    print(f"ทิศทางเทรนด์                : {result['trend']}")
+    print("-" * 55)
+    print(f"📊 Trend Score  : {result['trend_score']:+.2f}   📊 Range Score : {result['range_score']:+.2f}")
+    print(f"📊 Combined Score (ถ่วงน้ำหนักแล้ว) : {result['combined_score']:+.2f}")
     print("-" * 55)
 
     signal = result["signal"]
